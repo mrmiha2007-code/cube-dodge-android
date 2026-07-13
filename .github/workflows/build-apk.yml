@@ -1,0 +1,654 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Cube Dodge arm64 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out game files
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and NDK
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;23.2.8568313"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up CMake 3.30.3
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.30.3"
+
+      - name: Prepare raylib Android project
+        shell: bash
+        run: |
+          git clone --depth 1 --branch 5.5.1 --recurse-submodules \
+            https://github.com/Bigfoot71/raymob.git android-build
+
+          rm android-build/app/src/main/cpp/main.c
+          cp "upload/main(1).cpp" android-build/app/src/main/cpp/main.cpp
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          properties_path = Path("android-build/gradle.properties")
+          properties = properties_path.read_text(encoding="utf-8")
+          replacements = {
+              "projectName=raymob": "projectName=CubeDodgeAndroid",
+              "app.name=raymob": "app.name=Cube Dodge",
+              "app.native_library_name=raymob": "app.native_library_name=cube_dodge",
+              "app.application_id=com.raylib.raymob": "app.application_id=com.example.cubedodge",
+              "app.orientation=landscape": "app.orientation=landscape",
+              "display.keep_on=true": "display.keep_on=true",
+              "display.immersive=true": "display.immersive=true",
+              "display.into_cutout=true": "display.into_cutout=false",
+              "requirements.vibration=false": "requirements.vibration=true",
+          }
+          for old, new in replacements.items():
+              if old not in properties:
+                  raise RuntimeError(f"Expected raymob property was not found: {old}")
+              properties = properties.replace(old, new, 1)
+          properties_path.write_text(properties, encoding="utf-8")
+
+          gradle_path = Path("android-build/app/build.gradle")
+          gradle = gradle_path.read_text(encoding="utf-8")
+          compile_sdk_pattern = r"(?m)^([ \t]*)compileSdk[ \t]+\d+[ \t]*$"
+          compile_sdk_match = re.search(compile_sdk_pattern, gradle)
+          if not compile_sdk_match:
+              raise RuntimeError("Expected compileSdk setting was not found")
+          indent = compile_sdk_match.group(1)
+          gradle = re.sub(
+              compile_sdk_pattern,
+              f'{indent}compileSdk 34\n{indent}ndkVersion "23.2.8568313"',
+              gradle,
+              count=1,
+          )
+          default_config_pattern = r"(?m)^([ \t]*)defaultConfig[ \t]*\{[ \t]*$"
+          default_config_match = re.search(default_config_pattern, gradle)
+          if not default_config_match:
+              raise RuntimeError("Expected defaultConfig block was not found")
+          indent = default_config_match.group(1)
+          child_indent = indent + "    "
+          gradle = re.sub(
+              default_config_pattern,
+              (f"{indent}defaultConfig {{\n{child_indent}ndk {{\n"
+               f"{child_indent}    abiFilters 'arm64-v8a'\n{child_indent}}}"),
+              gradle,
+              count=1,
+          )
+          gradle_path.write_text(gradle, encoding="utf-8")
+
+          native_loader_path = Path(
+              "android-build/app/src/main/java/com/raylib/raymob/NativeLoader.java"
+          )
+          native_loader = native_loader_path.read_text(encoding="utf-8")
+          on_create_marker = "super.onCreate(savedInstanceState);"
+          if on_create_marker not in native_loader:
+              raise RuntimeError("NativeLoader onCreate marker was not found")
+          native_loader = native_loader.replace(
+              on_create_marker,
+              on_create_marker
+              + "\n        com.example.cubedodge.HapticBridge.start(this);",
+              1,
+          )
+
+          on_resume_marker = "protected void onResume() {\n        super.onResume();"
+          if on_resume_marker not in native_loader:
+              raise RuntimeError("NativeLoader onResume marker was not found")
+          native_loader = native_loader.replace(
+              on_resume_marker,
+              on_resume_marker
+              + "\n        com.example.cubedodge.HapticBridge.resume(this);",
+              1,
+          )
+
+          on_pause_marker = "protected void onPause() {\n        super.onPause();"
+          if on_pause_marker not in native_loader:
+              raise RuntimeError("NativeLoader onPause marker was not found")
+          native_loader = native_loader.replace(
+              on_pause_marker,
+              on_pause_marker
+              + "\n        com.example.cubedodge.HapticBridge.pause();",
+              1,
+          )
+
+          native_methods_marker = "    private native void onAppStart();"
+          if native_methods_marker not in native_loader:
+              raise RuntimeError("NativeLoader native methods marker was not found")
+          native_loader = native_loader.replace(
+              native_methods_marker,
+              """    @Override
+              protected void onDestroy() {
+                  com.example.cubedodge.HapticBridge.stop();
+                  super.onDestroy();
+              }
+
+          """ + native_methods_marker,
+              1,
+          )
+          native_loader_path.write_text(native_loader, encoding="utf-8")
+
+          manifest_path = Path("android-build/app/src/main/AndroidManifest.xml")
+          manifest = manifest_path.read_text(encoding="utf-8")
+          usb_feature_marker = (
+              '    <uses-feature android:glEsVersion="${GL_VERSION_CODE}" '
+              'android:required="true" />'
+          )
+          if usb_feature_marker not in manifest:
+              raise RuntimeError("AndroidManifest OpenGL feature marker was not found")
+          manifest = manifest.replace(
+              usb_feature_marker,
+              usb_feature_marker
+              + '\n\n    <uses-feature android:name="android.hardware.usb.host" '
+              'android:required="false" />',
+              1,
+          )
+          manifest_path.write_text(manifest, encoding="utf-8")
+
+          haptic_bridge_path = Path(
+              "android-build/app/src/main/java/com/example/cubedodge/HapticBridge.java"
+          )
+          haptic_bridge_path.parent.mkdir(parents=True, exist_ok=True)
+          haptic_bridge_path.write_text(r'''package com.example.cubedodge;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+          import android.os.VibratorManager;
+          import android.view.InputDevice;
+
+          public final class HapticBridge {
+              private static final int HAPTIC_LIFE_LOST = 1;
+              private static final int HAPTIC_ULTIMATE = 2;
+              private static final int TRIGGER_PULSE_ULTIMATE = 1;
+              private static final long POLL_INTERVAL_MS = 16L;
+              private static final Handler HANDLER = new Handler(Looper.getMainLooper());
+
+              private static Activity activity;
+              private static boolean running;
+
+              private HapticBridge() {}
+
+              private static native int consumeHapticEvent();
+              private static native boolean isUltimateReady();
+              private static native int consumeAdaptiveTriggerPulse();
+
+              public static void start(Activity owner) {
+                  activity = owner;
+                  DualSenseUsb.start(owner);
+                  if (!running) {
+                      running = true;
+                      HANDLER.post(POLL_EVENTS);
+                  }
+              }
+
+              public static void resume(Activity owner) {
+                  start(owner);
+              }
+
+              public static void pause() {
+                  running = false;
+                  HANDLER.removeCallbacks(POLL_EVENTS);
+                  DualSenseUsb.pause();
+              }
+
+              public static void stop() {
+                  pause();
+                  DualSenseUsb.stop();
+                  activity = null;
+              }
+
+              private static final Runnable POLL_EVENTS = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!running || activity == null) return;
+
+                      int event = 0;
+                      int triggerPulse = 0;
+                      boolean ultimateReady = false;
+                      try {
+                          event = consumeHapticEvent();
+                          triggerPulse = consumeAdaptiveTriggerPulse();
+                          ultimateReady = isUltimateReady();
+                      } catch (UnsatisfiedLinkError ignored) {
+                          //The native library can still be starting during the first frame.
+                      }
+
+                      if (event == HAPTIC_LIFE_LOST || event == HAPTIC_ULTIMATE) {
+                          playHaptic(event);
+                      }
+                      DualSenseUsb.update(
+                              ultimateReady,
+                              triggerPulse == TRIGGER_PULSE_ULTIMATE
+                      );
+                      HANDLER.postDelayed(this, POLL_INTERVAL_MS);
+                  }
+              };
+
+              private static void playHaptic(int event) {
+                  InputDevice controller = findController();
+                  if (controller != null && vibrateController(controller, event)) return;
+
+                  //Some Android builds expose controller input but hide its motors.
+                  //In that case the phone gives feedback instead of doing nothing.
+                  vibratePhone(event);
+              }
+
+              private static InputDevice findController() {
+                  for (int deviceId : InputDevice.getDeviceIds()) {
+                      InputDevice device = InputDevice.getDevice(deviceId);
+                      if (device == null) continue;
+
+                      int sources = device.getSources();
+                      boolean isGamepad = (sources & InputDevice.SOURCE_GAMEPAD)
+                              == InputDevice.SOURCE_GAMEPAD;
+                      boolean isJoystick = (sources & InputDevice.SOURCE_JOYSTICK)
+                              == InputDevice.SOURCE_JOYSTICK;
+                      if (isGamepad || isJoystick) return device;
+                  }
+                  return null;
+              }
+
+              private static boolean vibrateController(InputDevice controller, int event) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      VibratorManager manager = controller.getVibratorManager();
+                      int[] vibratorIds = manager.getVibratorIds();
+                      if (vibratorIds.length == 0) return false;
+
+                      for (int i = 0; i < vibratorIds.length; i++) {
+                          manager.getVibrator(vibratorIds[i]).vibrate(createEffect(event, i));
+                      }
+                      return true;
+                  }
+
+                  Vibrator vibrator = controller.getVibrator();
+                  if (vibrator == null || !vibrator.hasVibrator()) return false;
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      vibrator.vibrate(createEffect(event, 0));
+                  } else {
+                      vibrator.vibrate(event == HAPTIC_LIFE_LOST ? 90L : 420L);
+                  }
+                  return true;
+              }
+
+              private static void vibratePhone(int event) {
+                  if (activity == null) return;
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      VibratorManager manager = (VibratorManager) activity.getSystemService(
+                              Context.VIBRATOR_MANAGER_SERVICE
+                      );
+                      if (manager != null) {
+                          manager.getDefaultVibrator().vibrate(createEffect(event, 0));
+                      }
+                  } else {
+                      Vibrator vibrator = (Vibrator) activity.getSystemService(
+                              Context.VIBRATOR_SERVICE
+                      );
+                      if (vibrator == null || !vibrator.hasVibrator()) return;
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          vibrator.vibrate(createEffect(event, 0));
+                      } else {
+                          vibrator.vibrate(event == HAPTIC_LIFE_LOST ? 90L : 420L);
+                      }
+                  }
+              }
+
+              private static VibrationEffect createEffect(int event, int motorIndex) {
+                  if (event == HAPTIC_LIFE_LOST) {
+                      int amplitude = motorIndex == 0 ? 70 : 95;
+                      return VibrationEffect.createOneShot(90L, amplitude);
+                  }
+
+                  long[] timings = { 0L, 70L, 35L, 110L, 30L, 180L };
+                  int heavy = motorIndex == 0 ? 255 : 220;
+                  int[] amplitudes = { 0, 145, 0, 205, 0, heavy };
+                  return VibrationEffect.createWaveform(timings, amplitudes, -1);
+              }
+          }
+          ''', encoding="utf-8")
+
+          dualsense_usb_path = Path(
+              "android-build/app/src/main/java/com/example/cubedodge/DualSenseUsb.java"
+          )
+          dualsense_usb_path.write_text(r'''package com.example.cubedodge;
+
+          import android.app.Activity;
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.hardware.usb.UsbConstants;
+          import android.hardware.usb.UsbDevice;
+          import android.hardware.usb.UsbDeviceConnection;
+          import android.hardware.usb.UsbInterface;
+          import android.hardware.usb.UsbManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+
+          import java.util.HashMap;
+
+          final class DualSenseUsb {
+              private static final String ACTION_USB_PERMISSION =
+                      "com.example.cubedodge.USB_PERMISSION";
+              private static final int SONY_VENDOR_ID = 0x054c;
+              private static final int DUALSENSE_PRODUCT_ID = 0x0ce6;
+
+              private static final int TRIGGER_OFF = 0;
+              private static final int TRIGGER_READY = 1;
+              private static final int TRIGGER_ULTIMATE = 2;
+              private static final long ULTIMATE_TRIGGER_MS = 280L;
+              private static final Handler HANDLER = new Handler(Looper.getMainLooper());
+
+              private static Activity activity;
+              private static UsbManager usbManager;
+              private static PendingIntent permissionIntent;
+              private static BroadcastReceiver usbReceiver;
+              private static UsbDevice usbDevice;
+              private static UsbDeviceConnection connection;
+              private static int hidInterfaceId = -1;
+              private static int appliedState = -1;
+              private static int effectGeneration;
+              private static boolean desiredReady;
+              private static boolean ultimateEffectActive;
+              private static boolean writeBlocked;
+              private static boolean started;
+
+              private DualSenseUsb() {}
+
+              static void start(Activity owner) {
+                  activity = owner;
+                  if (!started) {
+                      started = true;
+                      usbManager = (UsbManager) owner.getSystemService(Context.USB_SERVICE);
+
+                      Intent permission = new Intent(ACTION_USB_PERMISSION)
+                              .setPackage(owner.getPackageName());
+                      int pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                          pendingFlags |= PendingIntent.FLAG_IMMUTABLE;
+                      }
+                      permissionIntent = PendingIntent.getBroadcast(
+                              owner, 0, permission, pendingFlags
+                      );
+
+                      usbReceiver = new BroadcastReceiver() {
+                          @Override
+                          public void onReceive(Context context, Intent intent) {
+                              String action = intent.getAction();
+                              UsbDevice device = getUsbDevice(intent);
+
+                              if (ACTION_USB_PERMISSION.equals(action)) {
+                                  boolean granted = intent.getBooleanExtra(
+                                          UsbManager.EXTRA_PERMISSION_GRANTED, false
+                                  );
+                                  if (granted && isDualSense(device)) openDevice(device);
+                              } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
+                                  scanForDualSense();
+                              } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action) &&
+                                      sameDevice(device, usbDevice)) {
+                                  resetAndClose();
+                              }
+                          }
+                      };
+
+                      IntentFilter filter = new IntentFilter(ACTION_USB_PERMISSION);
+                      filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+                      filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                          owner.registerReceiver(
+                                  usbReceiver, filter, Context.RECEIVER_EXPORTED
+                          );
+                      } else {
+                          owner.registerReceiver(usbReceiver, filter);
+                      }
+                  }
+                  scanForDualSense();
+              }
+
+              static void update(boolean ready, boolean ultimatePulse) {
+                  desiredReady = ready;
+                  if (connection == null || writeBlocked) return;
+
+                  if (ultimatePulse) {
+                      ultimateEffectActive = true;
+                      final int generation = ++effectGeneration;
+                      applyState(TRIGGER_ULTIMATE);
+                      HANDLER.postDelayed(new Runnable() {
+                          @Override
+                          public void run() {
+                              if (generation != effectGeneration) return;
+                              ultimateEffectActive = false;
+                              applyState(desiredReady ? TRIGGER_READY : TRIGGER_OFF);
+                          }
+                      }, ULTIMATE_TRIGGER_MS);
+                      return;
+                  }
+
+                  if (!ultimateEffectActive) {
+                      applyState(ready ? TRIGGER_READY : TRIGGER_OFF);
+                  }
+              }
+
+              static void pause() {
+                  desiredReady = false;
+                  ultimateEffectActive = false;
+                  effectGeneration += 1;
+                  HANDLER.removeCallbacksAndMessages(null);
+                  if (connection != null) {
+                      sendTriggerReport(TRIGGER_OFF);
+                      appliedState = TRIGGER_OFF;
+                  }
+              }
+
+              static void stop() {
+                  pause();
+                  resetAndClose();
+                  if (activity != null && usbReceiver != null) {
+                      try {
+                          activity.unregisterReceiver(usbReceiver);
+                      } catch (IllegalArgumentException ignored) {
+                          //Receiver was already removed by Android.
+                      }
+                  }
+                  usbReceiver = null;
+                  permissionIntent = null;
+                  usbManager = null;
+                  activity = null;
+                  started = false;
+              }
+
+              private static void scanForDualSense() {
+                  if (usbManager == null || connection != null) return;
+
+                  HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
+                  for (UsbDevice device : devices.values()) {
+                      if (!isDualSense(device)) continue;
+
+                      if (usbManager.hasPermission(device)) {
+                          openDevice(device);
+                      } else if (permissionIntent != null) {
+                          usbManager.requestPermission(device, permissionIntent);
+                      }
+                      return;
+                  }
+              }
+
+              private static void openDevice(UsbDevice device) {
+                  if (usbManager == null || !isDualSense(device) ||
+                          !usbManager.hasPermission(device)) return;
+                  resetAndClose();
+
+                  UsbInterface hidInterface = findGamepadInterface(device);
+                  if (hidInterface == null) return;
+
+                  UsbDeviceConnection opened = usbManager.openDevice(device);
+                  if (opened == null) return;
+
+                  usbDevice = device;
+                  connection = opened;
+                  hidInterfaceId = hidInterface.getId();
+                  appliedState = -1;
+                  writeBlocked = false;
+
+                  //Endpoint zero does not claim the HID interface, so Android keeps
+                  //reading sticks and buttons while we only update the trigger motors.
+                  if (!sendTriggerReport(TRIGGER_OFF)) {
+                      writeBlocked = true;
+                      return;
+                  }
+                  appliedState = TRIGGER_OFF;
+                  applyState(desiredReady ? TRIGGER_READY : TRIGGER_OFF);
+              }
+
+              private static UsbInterface findGamepadInterface(UsbDevice device) {
+                  for (int i = 0; i < device.getInterfaceCount(); i++) {
+                      UsbInterface candidate = device.getInterface(i);
+                      if (candidate.getInterfaceClass() == UsbConstants.USB_CLASS_HID) {
+                          return candidate;
+                      }
+                  }
+                  return null;
+              }
+
+              private static void applyState(int state) {
+                  if (connection == null || writeBlocked || state == appliedState) return;
+                  if (sendTriggerReport(state)) {
+                      appliedState = state;
+                  } else {
+                      //One best-effort reset prevents a half-applied effect from
+                      //remaining active after a transient USB write error.
+                      sendTriggerReport(TRIGGER_OFF);
+                      appliedState = TRIGGER_OFF;
+                      //Do not retry every 16 ms on phones whose USB stack blocks
+                      //class reports. Normal controller input and vibration still work.
+                      writeBlocked = true;
+                  }
+              }
+
+              private static boolean sendTriggerReport(int state) {
+                  if (connection == null || hidInterfaceId < 0) return false;
+
+                  byte[] report = new byte[48];
+                  report[0] = 0x02;       //USB HID output report ID
+                  report[1] = 0x0c;       //right-trigger + left-trigger update flags
+
+                  fillTriggerEffect(report, 11, state);
+                  fillTriggerEffect(report, 22, state);
+
+                  int result = connection.controlTransfer(
+                          0x21,            //host-to-device, HID class, interface
+                          0x09,            //SET_REPORT
+                          0x0202,          //output report, ID 0x02
+                          hidInterfaceId,
+                          report,
+                          report.length,
+                          80
+                  );
+                  return result >= 0;
+              }
+
+              private static void fillTriggerEffect(byte[] report, int offset, int state) {
+                  if (state == TRIGGER_READY) {
+                      //A mild resistance from roughly one third of the travel.
+                      report[offset] = 0x01;
+                      report[offset + 1] = 0x03;
+                      report[offset + 2] = 0x03;
+                  } else if (state == TRIGGER_ULTIMATE) {
+                      //A strong weapon-style wall followed by a tactile break-through.
+                      report[offset] = 0x02;
+                      report[offset + 1] = 0x02;
+                      report[offset + 2] = 0x07;
+                      report[offset + 3] = 0x08;
+                  }
+              }
+
+              private static void resetAndClose() {
+                  if (connection != null) {
+                      sendTriggerReport(TRIGGER_OFF);
+                  }
+                  if (connection != null) connection.close();
+                  connection = null;
+                  usbDevice = null;
+                  hidInterfaceId = -1;
+                  appliedState = -1;
+                  writeBlocked = false;
+                  ultimateEffectActive = false;
+                  effectGeneration += 1;
+              }
+
+              private static boolean isDualSense(UsbDevice device) {
+                  return device != null &&
+                          device.getVendorId() == SONY_VENDOR_ID &&
+                          device.getProductId() == DUALSENSE_PRODUCT_ID;
+              }
+
+              private static boolean sameDevice(UsbDevice left, UsbDevice right) {
+                  return left != null && right != null &&
+                          left.getDeviceId() == right.getDeviceId();
+              }
+
+              @SuppressWarnings("deprecation")
+              private static UsbDevice getUsbDevice(Intent intent) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
+                  }
+                  return intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+              }
+          }
+          ''', encoding="utf-8")
+          PY
+
+      - name: Build debug APK
+        working-directory: android-build
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          mkdir -p output
+          apk_path="$(find android-build/app/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
+          test -n "$apk_path"
+          cp "$apk_path" output/CubeDodge-android-arm64-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CubeDodge-Android-APK
+          path: output/CubeDodge-android-arm64-debug.apk
+          if-no-files-found: error
+          retention-days: 30

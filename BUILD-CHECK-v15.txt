@@ -1,0 +1,10 @@
+Cube Dodge Android bundle: v15-horizontal-fix
+Created: 2026-07-14
+
+Verification markers:
+- upload/main(1).cpp size: 51926 bytes
+- upload/main(1).cpp contains: nextHorizontalY
+- upload/main(1).cpp contains: SETTINGS
+- .github/workflows/build-apk.yml contains: DualSenseUsb
+
+If these markers are missing after extraction, an older archive was opened.

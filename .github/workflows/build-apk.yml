@@ -356,6 +356,7 @@ jobs:
           import android.os.Build;
           import android.os.Handler;
           import android.os.Looper;
+          import android.widget.Toast;
 
           import java.util.HashMap;
 
@@ -413,7 +414,11 @@ jobs:
                                   boolean granted = intent.getBooleanExtra(
                                           UsbManager.EXTRA_PERMISSION_GRANTED, false
                                   );
-                                  if (granted && isDualSense(device)) openDevice(device);
+                                  if (granted && isDualSense(device)) {
+                                      openDevice(device);
+                                  } else if (!granted && isDualSense(device)) {
+                                      showStatus("DualSense USB: доступ не разрешён");
+                                  }
                               } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
                                   scanForDualSense();
                               } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action) &&
@@ -526,10 +531,12 @@ jobs:
                   //reading sticks and buttons while we only update the trigger motors.
                   if (!sendTriggerReport(TRIGGER_OFF)) {
                       writeBlocked = true;
+                      showStatus("DualSense USB: команда триггеров заблокирована");
                       return;
                   }
                   appliedState = TRIGGER_OFF;
                   applyState(desiredReady ? TRIGGER_READY : TRIGGER_OFF);
+                  showStatus("DualSense USB: адаптивные триггеры подключены");
               }
 
               private static UsbInterface findGamepadInterface(UsbDevice device) {
@@ -554,29 +561,32 @@ jobs:
                       //Do not retry every 16 ms on phones whose USB stack blocks
                       //class reports. Normal controller input and vibration still work.
                       writeBlocked = true;
+                      showStatus("DualSense USB: ошибка отправки эффекта");
                   }
               }
 
               private static boolean sendTriggerReport(int state) {
                   if (connection == null || hidInterfaceId < 0) return false;
 
-                  byte[] report = new byte[48];
-                  report[0] = 0x02;       //USB HID output report ID
-                  report[1] = 0x0c;       //right-trigger + left-trigger update flags
+                  //SET_REPORT carries the report ID in wValue. The data stage must
+                  //start with the common payload, without a second 0x02 report ID.
+                  //The USB HID descriptor defines report 0x02 as 47 payload bytes.
+                  byte[] reportPayload = new byte[47];
+                  reportPayload[0] = 0x0c; //right-trigger + left-trigger update flags
 
-                  fillTriggerEffect(report, 11, state);
-                  fillTriggerEffect(report, 22, state);
+                  fillTriggerEffect(reportPayload, 10, state);
+                  fillTriggerEffect(reportPayload, 21, state);
 
                   int result = connection.controlTransfer(
                           0x21,            //host-to-device, HID class, interface
                           0x09,            //SET_REPORT
                           0x0202,          //output report, ID 0x02
                           hidInterfaceId,
-                          report,
-                          report.length,
+                          reportPayload,
+                          reportPayload.length,
                           80
                   );
-                  return result >= 0;
+                  return result == reportPayload.length;
               }
 
               private static void fillTriggerEffect(byte[] report, int offset, int state) {
@@ -592,6 +602,17 @@ jobs:
                       report[offset + 2] = 0x07;
                       report[offset + 3] = 0x08;
                   }
+              }
+
+              private static void showStatus(String message) {
+                  Activity owner = activity;
+                  if (owner == null) return;
+                  owner.runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          Toast.makeText(owner, message, Toast.LENGTH_SHORT).show();
+                      }
+                  });
               }
 
               private static void resetAndClose() {

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include "raylib.h"
 #if defined(PLATFORM_ANDROID)
 #include <atomic>
@@ -277,8 +278,9 @@ int main()
     int screenShakeFrames = 0;
     bool settingsOpen = false;
     int settingsSelected = 0;
-    const int settingsCount = 1;
+    const int settingsCount = 2;
     bool accelerationEnabled = false;
+    bool dpadMovementEnabled = false;
     const int maxParticles = 64;
     ExplosionParticle particles[maxParticles]{};
     int particleIndex = 0;
@@ -350,6 +352,12 @@ int main()
         };
 
         Character player{375,275,50,50,5};
+        float playerExactX = (float)player.x;
+        float playerExactY = (float)player.y;
+        float lastMoveX = 0.0f;
+        float lastMoveY = 0.0f;
+        float dashDirectionX = 0.0f;
+        float dashDirectionY = 0.0f;
         Character enemy1{GetRandomValue(0,760),-50,40,40,4};
         Character enemy2{GetRandomValue(0,760),-300,40,40,4};
         Character enemy3{GetRandomValue(0,760),-500,40,40,4};
@@ -416,12 +424,7 @@ int main()
             leftStickY = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
         }
 
-        bool moveRight = IsKeyDown(KEY_D) || leftStickX > gamepadDeadzone;
-        bool moveLeft = IsKeyDown(KEY_A) || leftStickX < -gamepadDeadzone;
-        bool moveUp = IsKeyDown(KEY_W) || leftStickY < -gamepadDeadzone;
-        bool moveDown = IsKeyDown(KEY_S) || leftStickY > gamepadDeadzone;
-
-        //Options открывает настройки поверх игры: сама игра при этом не ставится на паузу.
+        //Options открывает настройки и полностью замораживает игровую логику.
         if (IsKeyPressed(KEY_F10) ||
             gamepadButtonPressed(GAMEPAD_BUTTON_MIDDLE_RIGHT, DIRECT_USB_OPTIONS)) {
             settingsOpen = !settingsOpen;
@@ -444,26 +447,85 @@ int main()
                 gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_LEFT, DIRECT_USB_SQUARE);
             if (toggleSetting && settingsSelected == 0)
                 accelerationEnabled = !accelerationEnabled;
+            if (toggleSetting && settingsSelected == 1)
+                dpadMovementEnabled = !dpadMovementEnabled;
         }
+
+        float moveX = 0.0f;
+        float moveY = 0.0f;
+        if (!settingsOpen) {
+            float keyboardX = 0.0f;
+            float keyboardY = 0.0f;
+            if (IsKeyDown(KEY_D)) keyboardX += 1.0f;
+            if (IsKeyDown(KEY_A)) keyboardX -= 1.0f;
+            if (IsKeyDown(KEY_S)) keyboardY += 1.0f;
+            if (IsKeyDown(KEY_W)) keyboardY -= 1.0f;
+
+            //Клавиатура остаётся доступна в обоих режимах управления геймпадом.
+            if (keyboardX != 0.0f || keyboardY != 0.0f) {
+                float length = std::sqrt(keyboardX*keyboardX + keyboardY*keyboardY);
+                moveX = keyboardX/length;
+                moveY = keyboardY/length;
+            } else if (dpadMovementEnabled) {
+                float dpadX = 0.0f;
+                float dpadY = 0.0f;
+                if (gamepadButtonDown(GAMEPAD_BUTTON_LEFT_FACE_RIGHT, DIRECT_USB_DPAD_RIGHT))
+                    dpadX += 1.0f;
+                if (gamepadButtonDown(GAMEPAD_BUTTON_LEFT_FACE_LEFT, DIRECT_USB_DPAD_LEFT))
+                    dpadX -= 1.0f;
+                if (gamepadButtonDown(GAMEPAD_BUTTON_LEFT_FACE_DOWN, DIRECT_USB_DPAD_DOWN))
+                    dpadY += 1.0f;
+                if (gamepadButtonDown(GAMEPAD_BUTTON_LEFT_FACE_UP, DIRECT_USB_DPAD_UP))
+                    dpadY -= 1.0f;
+
+                if (dpadX != 0.0f || dpadY != 0.0f) {
+                    float length = std::sqrt(dpadX*dpadX + dpadY*dpadY);
+                    moveX = dpadX/length;
+                    moveY = dpadY/length;
+                }
+            } else {
+                //Стик использует круглую мёртвую зону и 16 равных секторов по 22.5°.
+                float stickLength = std::sqrt(leftStickX*leftStickX + leftStickY*leftStickY);
+                if (stickLength > gamepadDeadzone) {
+                    const float pi = 3.14159265358979323846f;
+                    const float directionStep = pi/8.0f;
+                    float angle = std::atan2(leftStickY, leftStickX);
+                    float quantizedAngle = std::round(angle/directionStep)*directionStep;
+                    moveX = std::cos(quantizedAngle);
+                    moveY = std::sin(quantizedAngle);
+                }
+            }
+
+            if (moveX != 0.0f || moveY != 0.0f) {
+                lastMoveX = moveX;
+                lastMoveY = moveY;
+            }
+        }
+        bool dashActiveThisFrame = false;
 
         //выход
         if (IsKeyPressed(KEY_ESCAPE)) break;
-        //Ускорение сначала нужно включить в настройках, затем удерживать L1 + R1.
-        //Пробел оставлен как клавиатурный вариант для запуска и тестов через VS Code.
-        bool accelerationHeld = (IsKeyDown(KEY_SPACE) ||
-            (gamepadButtonDown(GAMEPAD_BUTTON_LEFT_TRIGGER_1, DIRECT_USB_L1) &&
-             gamepadButtonDown(GAMEPAD_BUTTON_RIGHT_TRIGGER_1, DIRECT_USB_R1)));
-        if (accelerationEnabled && accelerationHeld) speedBoost = 2;
-        //Переключатель худа: H на клавиатуре или круг на DualSense
-        if (IsKeyPressed(KEY_H) ||
-            gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, DIRECT_USB_CIRCLE)) hideHUD = 1 - 1*hideHUD;
-        //Быстрый лвл скип
-        if (IsKeyPressed(KEY_ONE)) Score = 0;
-        if (IsKeyPressed(KEY_TWO)) Score = 500;
-        if (IsKeyPressed(KEY_THREE)) Score = 1800;
-        if (IsKeyPressed(KEY_FOUR)) Score = 4000;
-        if (IsKeyPressed(KEY_FIVE)) Score = 8000;
-        if (IsKeyPressed(KEY_SIX)) Score = 12000;
+        if (!settingsOpen) {
+            //Ускорение сначала нужно включить в настройках, затем удерживать L1 + R1.
+            //Пробел оставлен как клавиатурный вариант для запуска и тестов через VS Code.
+            bool accelerationHeld = (IsKeyDown(KEY_SPACE) ||
+                (gamepadButtonDown(GAMEPAD_BUTTON_LEFT_TRIGGER_1, DIRECT_USB_L1) &&
+                 gamepadButtonDown(GAMEPAD_BUTTON_RIGHT_TRIGGER_1, DIRECT_USB_R1)));
+            if (accelerationEnabled && accelerationHeld) speedBoost = 2;
+
+            //Переключатель худа: H на клавиатуре или круг на DualSense
+            if (IsKeyPressed(KEY_H) ||
+                gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, DIRECT_USB_CIRCLE))
+                hideHUD = 1 - hideHUD;
+
+            //Быстрый лвл скип
+            if (IsKeyPressed(KEY_ONE)) Score = 0;
+            if (IsKeyPressed(KEY_TWO)) Score = 500;
+            if (IsKeyPressed(KEY_THREE)) Score = 1800;
+            if (IsKeyPressed(KEY_FOUR)) Score = 4000;
+            if (IsKeyPressed(KEY_FIVE)) Score = 8000;
+            if (IsKeyPressed(KEY_SIX)) Score = 12000;
+        }
         //Фулскрин
         if (IsKeyPressed(KEY_F11) ||
             gamepadButtonPressed(GAMEPAD_BUTTON_MIDDLE_LEFT, DIRECT_USB_CREATE)) {
@@ -471,7 +533,7 @@ int main()
         }
 
 
-        if (Gameover == 0) {
+        if (Gameover == 0 && !settingsOpen) {
             //Ульта заряжается за 15 секунд. Для активации нужно одновременно нажать L2 и R2
             if (ultimateLockFrames > 0) ultimateLockFrames -= 1;
             if (ultimateFlashFrames == 0 && ultimateCharge < ultimateMax) ultimateCharge += 1;
@@ -575,19 +637,18 @@ int main()
                DashChargesSec -= 180;
             }
             if ((IsKeyPressed(KEY_LEFT_SHIFT) ||
-                (!settingsOpen &&
-                    gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_LEFT, DIRECT_USB_SQUARE))) &&
+                gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_LEFT, DIRECT_USB_SQUARE)) &&
                 DashCharges > 0) {
+                if (moveX != 0.0f || moveY != 0.0f) {
+                    dashDirectionX = moveX;
+                    dashDirectionY = moveY;
+                } else {
+                    dashDirectionX = lastMoveX;
+                    dashDirectionY = lastMoveY;
+                }
                 DashEffect += 8;
                 invFrames += 8;
                 DashCharges -= 1;
-            }
-            if (DashEffect > 0 && ultimateFlashFrames == 0) {
-                if (moveRight) player.x += 15;
-                if (moveLeft) player.x -= 15;
-                if (moveUp) player.y -= 15;
-                if (moveDown) player.y += 15;
-                DashEffect -= 1;
             }
             if (invFrames > 0) invFrames -= 1;
             if (lifeInvFrames > 0) lifeInvFrames -= 1;
@@ -735,11 +796,20 @@ int main()
             
             
 
-            //Движение игрока, движение врага
-            if (ultimateFlashFrames == 0 && moveRight) player.x += player.speed*speedBoost;
-            if (ultimateFlashFrames == 0 && moveLeft) player.x -= player.speed*speedBoost;
-            if (ultimateFlashFrames == 0 && moveUp) player.y -= player.speed*speedBoost;
-            if (ultimateFlashFrames == 0 && moveDown) player.y += player.speed*speedBoost;
+            //Обычное движение и деш используют один нормализованный вектор.
+            //Во время деша направление фиксируется, поэтому его нельзя ускорить диагональю.
+            if (ultimateFlashFrames == 0) {
+                dashActiveThisFrame = DashEffect > 0;
+                if (dashActiveThisFrame) {
+                    float dashSpeed = 15.0f + player.speed*speedBoost;
+                    playerExactX += dashDirectionX*dashSpeed;
+                    playerExactY += dashDirectionY*dashSpeed;
+                    DashEffect -= 1;
+                } else {
+                    playerExactX += moveX*player.speed*speedBoost;
+                    playerExactY += moveY*player.speed*speedBoost;
+                }
+            }
             if (ultimateFlashFrames == 0 && lvl >= 1) enemy1.y += enemy1.speed*speedBoost;
             if (ultimateFlashFrames == 0 && lvl >= 2) enemy2.y += enemy2.speed*speedBoost;
             if (ultimateFlashFrames == 0 && lvl >= 4 && side1Delay > 0) side1Delay -= 1;
@@ -846,10 +916,12 @@ int main()
 
 
             //Границы окна
-            if (player.x < 0) player.x = 0;
-            if (player.x > 800-player.size_x) player.x = 800-player.size_x;
-            if (player.y < 0) player.y = 0;
-            if (player.y > 600-player.size_y) player.y = 600-player.size_y;
+            if (playerExactX < 0.0f) playerExactX = 0.0f;
+            if (playerExactX > 800-player.size_x) playerExactX = 800-player.size_x;
+            if (playerExactY < 0.0f) playerExactY = 0.0f;
+            if (playerExactY > 600-player.size_y) playerExactY = 600-player.size_y;
+            player.x = (int)std::round(playerExactX);
+            player.y = (int)std::round(playerExactY);
 
 
             //коллизии
@@ -866,75 +938,75 @@ int main()
             bool playerHit = false;
             if (CheckCollisionRecs(playerRect , enemy1Rect) && lvl >= 1)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , enemy2Rect) && lvl >= 2)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , enemy3Rect) && lvl >= 5)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , enemy4Rect) && lvl >= 8)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , side1Rect) && lvl >= 4)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , side3Rect) && lvl >= 4)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , side2Rect) && lvl >= 7)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , side4Rect) && lvl >= 7)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=20;
                     DashChargesSec+=6;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
             if (CheckCollisionRecs(playerRect , LASERRect) && lvl >= 6)
             {
-                if (DashEffect > 0) {
+                if (dashActiveThisFrame) {
                     Score+=50;
                     DashChargesSec+=30;
                 };
-                if (DashEffect == 0 && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
+                if (!dashActiveThisFrame && invFrames == 0 && lifeInvFrames == 0) playerHit = true;
             }
 
             if (playerHit) {
@@ -956,30 +1028,32 @@ int main()
 
         //Java считывает текущее состояние, поэтому эффект восстановится и после
         //повторного подключения USB-геймпада. Во время блокировки сопротивления нет.
-        setAndroidUltimateReady(Gameover == 0 && ultimateCharge == ultimateMax &&
+        setAndroidUltimateReady(!settingsOpen && Gameover == 0 && ultimateCharge == ultimateMax &&
             ultimateLockFrames == 0 && ultimateFlashFrames == 0);
 
 
         //Обновляем осколки и волну от ульты
-        for (int i = 0; i < maxParticles; i++) {
-            if (particles[i].life > 0) {
-                particles[i].x += particles[i].speedX;
-                particles[i].y += particles[i].speedY;
-                particles[i].speedY += 0.08f;
-                particles[i].size *= 0.94f;
-                particles[i].life -= 1;
+        if (!settingsOpen) {
+            for (int i = 0; i < maxParticles; i++) {
+                if (particles[i].life > 0) {
+                    particles[i].x += particles[i].speedX;
+                    particles[i].y += particles[i].speedY;
+                    particles[i].speedY += 0.08f;
+                    particles[i].size *= 0.94f;
+                    particles[i].life -= 1;
+                }
             }
-        }
 
-        if (ultimateRingAlpha > 0) {
-            ultimateRingRadius += 18;
-            ultimateRingAlpha -= 14;
-            if (ultimateRingAlpha < 0) ultimateRingAlpha = 0;
+            if (ultimateRingAlpha > 0) {
+                ultimateRingRadius += 18;
+                ultimateRingAlpha -= 14;
+                if (ultimateRingAlpha < 0) ultimateRingAlpha = 0;
+            }
         }
 
         int shakeX = 0;
         int shakeY = 0;
-        if (screenShakeFrames > 0) {
+        if (!settingsOpen && screenShakeFrames > 0) {
             shakeX = GetRandomValue(-5,5);
             shakeY = GetRandomValue(-5,5);
             screenShakeFrames -= 1;
@@ -1000,11 +1074,13 @@ int main()
             if (Gameover == 0) {
                 if (LASER.x > 800 && LASER.speed < 0 && lvl >= 6) {
                     DrawRectangle(790,0,10,600,lightred);
-                    if (LASER.x < 1300) LASERTransparency += 0.5*std::abs(LASER.speed);
+                    if (!settingsOpen && LASER.x < 1300)
+                        LASERTransparency += 0.5*std::abs(LASER.speed);
                 }
                 if (LASER.x < 0 && LASER.speed > 0 && lvl >= 6) {
                     DrawRectangle(0,0,10,600,lightred);
-                    if (LASER.x > -500) LASERTransparency += 0.5*std::abs(LASER.speed); 
+                    if (!settingsOpen && LASER.x > -500)
+                        LASERTransparency += 0.5*std::abs(LASER.speed);
                 }
             }
         }
@@ -1040,7 +1116,7 @@ int main()
         }
 
         //Во время неуязвимости игрок мигает
-        if (lifeInvFrames == 0 || (lifeInvFrames/6)%2 == 0)
+        if (settingsOpen || lifeInvFrames == 0 || (lifeInvFrames/6)%2 == 0)
             DrawRectangle(player.x + shakeX, player.y + shakeY, player.size_x, player.size_y, GREEN);
 
 
@@ -1090,10 +1166,16 @@ int main()
             DrawText("Wasted",105,50,164,VIOLET);
             DrawText("Press R",145,350,120,VIOLET);
             DrawText("to restart",80,460,120,VIOLET);
-            if (IsKeyPressed(KEY_R) ||
-                gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_UP, DIRECT_USB_TRIANGLE)) {
+            if (!settingsOpen && (IsKeyPressed(KEY_R) ||
+                gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_UP, DIRECT_USB_TRIANGLE))) {
                 player.x = 375;
                 player.y = 275;
+                playerExactX = (float)player.x;
+                playerExactY = (float)player.y;
+                lastMoveX = 0.0f;
+                lastMoveY = 0.0f;
+                dashDirectionX = 0.0f;
+                dashDirectionY = 0.0f;
                 enemy1.y = -50;
                 enemy1.x = GetRandomValue(0,800-enemy1.size_x);
                 enemy2.y = GetRandomValue(-400,-140);
@@ -1190,27 +1272,35 @@ int main()
             } 
         }
 
-        //Оверлей рисуется последним, поэтому остаётся поверх продолжающейся игры.
+        //Пауза рисуется последней, поэтому меню всегда остаётся поверх игры.
         if (settingsOpen) {
+            Color pauseShade{0,0,0,115};
             Color panelColor{12,12,16,225};
             Color rowColor{38,38,46,240};
             Color selectedColor{65,65,78,245};
 
-            DrawRectangle(145, 145, 510, 310, panelColor);
-            DrawRectangle(165, 165, 470, 270, BLACK);
-            DrawRectangle(168, 168, 464, 264, panelColor);
-            DrawText("SETTINGS", 278, 188, 36, WHITE);
+            DrawRectangle(0, 0, 800, 600, pauseShade);
+            DrawRectangle(145, 100, 510, 400, panelColor);
+            DrawRectangle(165, 120, 470, 360, BLACK);
+            DrawRectangle(168, 123, 464, 354, panelColor);
+            DrawText("PAUSED - SETTINGS", 205, 145, 32, WHITE);
 
-            DrawRectangle(195, 258, 410, 72,
+            DrawRectangle(195, 205, 410, 64,
                 settingsSelected == 0 ? selectedColor : rowColor);
-            DrawText(">", 213, 277, 30, RED);
-            DrawText("Acceleration", 250, 277, 30, WHITE);
-            DrawText(accelerationEnabled ? "ON" : "OFF", 535, 277, 30,
-                accelerationEnabled ? GREEN : LIGHTGRAY);
+            DrawRectangle(195, 280, 410, 64,
+                settingsSelected == 1 ? selectedColor : rowColor);
 
-            DrawText("D-PAD: SELECT", 205, 360, 20, LIGHTGRAY);
-            DrawText("SQUARE: TOGGLE", 430, 360, 20, LIGHTGRAY);
-            DrawText("OPTIONS: CLOSE", 315, 398, 20, LIGHTGRAY);
+            DrawText(">", 213, settingsSelected == 0 ? 222 : 297, 30, RED);
+            DrawText("Acceleration", 250, 222, 30, WHITE);
+            DrawText(accelerationEnabled ? "ON" : "OFF", 535, 222, 30,
+                accelerationEnabled ? GREEN : LIGHTGRAY);
+            DrawText("Gamepad input", 250, 297, 30, WHITE);
+            DrawText(dpadMovementEnabled ? "D-PAD" : "STICK", 500, 297, 30,
+                dpadMovementEnabled ? RED : GREEN);
+
+            DrawText("D-PAD: SELECT", 205, 370, 20, LIGHTGRAY);
+            DrawText("SQUARE: TOGGLE", 430, 370, 20, LIGHTGRAY);
+            DrawText("OPTIONS: RESUME", 292, 425, 20, LIGHTGRAY);
         }
 #if defined(PLATFORM_ANDROID)
         EndTextureMode();

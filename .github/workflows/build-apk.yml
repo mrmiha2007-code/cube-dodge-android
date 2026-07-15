@@ -63,8 +63,8 @@ jobs:
               "app.name=raymob": "app.name=Cube Dodge",
               "app.native_library_name=raymob": "app.native_library_name=cube_dodge",
               "app.application_id=com.raylib.raymob": "app.application_id=com.example.cubedodge",
-              "app.version_name=1.0": "app.version_name=17.0-direct-usb",
-              "app.version_code=1": "app.version_code=17",
+              "app.version_name=1.0": "app.version_name=18.0-movement-pause",
+              "app.version_code=1": "app.version_code=18",
               "app.orientation=landscape": "app.orientation=landscape",
               "display.keep_on=true": "display.keep_on=true",
               "display.immersive=true": "display.immersive=true",
@@ -751,7 +751,7 @@ jobs:
                               sentHapticState = requestedHaptic;
                               if (!connectionAnnounced) {
                                   connectionAnnounced = true;
-                                  showStatus("Cube Dodge v17: USB-ввод, вибрация и триггеры подключены");
+                                  showStatus("Cube Dodge v18: USB-ввод, вибрация и триггеры подключены");
                               }
                           }
 
@@ -1003,12 +1003,12 @@ jobs:
           mkdir -p output
           apk_path="$(find android-build/app/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
           test -n "$apk_path"
-          cp "$apk_path" output/CubeDodge-v17-direct-usb-arm64-debug.apk
+          cp "$apk_path" output/CubeDodge-v18-movement-pause-arm64-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: CubeDodge-v17-Direct-USB-APK
-          path: output/CubeDodge-v17-direct-usb-arm64-debug.apk
+          name: CubeDodge-v18-Movement-Pause-APK
+          path: output/CubeDodge-v18-movement-pause-arm64-debug.apk
           if-no-files-found: error
           retention-days: 30

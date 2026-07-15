@@ -63,6 +63,8 @@ jobs:
               "app.name=raymob": "app.name=Cube Dodge",
               "app.native_library_name=raymob": "app.native_library_name=cube_dodge",
               "app.application_id=com.raylib.raymob": "app.application_id=com.example.cubedodge",
+              "app.version_name=1.0": "app.version_name=17.0-direct-usb",
+              "app.version_code=1": "app.version_code=17",
               "app.orientation=landscape": "app.orientation=landscape",
               "display.keep_on=true": "display.keep_on=true",
               "display.immersive=true": "display.immersive=true",
@@ -244,7 +246,10 @@ jobs:
                       }
 
                       if (event == HAPTIC_LIFE_LOST || event == HAPTIC_ULTIMATE) {
-                          playHaptic(event);
+                          //При прямом USB-захвате Android больше не видит моторы
+                          //через InputDevice, поэтому сначала отправляем вибрацию
+                          //в том же DualSense output report. Телефон остаётся fallback.
+                          if (!DualSenseUsb.playHaptic(event)) playHaptic(event);
                       }
                       DualSenseUsb.update(
                               ultimateReady,
@@ -351,13 +356,16 @@ jobs:
           import android.hardware.usb.UsbConstants;
           import android.hardware.usb.UsbDevice;
           import android.hardware.usb.UsbDeviceConnection;
+          import android.hardware.usb.UsbEndpoint;
           import android.hardware.usb.UsbInterface;
           import android.hardware.usb.UsbManager;
+          import android.hardware.usb.UsbRequest;
           import android.os.Build;
           import android.os.Handler;
           import android.os.Looper;
           import android.widget.Toast;
 
+          import java.nio.ByteBuffer;
           import java.util.HashMap;
 
           final class DualSenseUsb {
@@ -369,6 +377,9 @@ jobs:
               private static final int TRIGGER_OFF = 0;
               private static final int TRIGGER_READY = 1;
               private static final int TRIGGER_ULTIMATE = 2;
+              private static final int HAPTIC_OFF = 0;
+              private static final int HAPTIC_LIFE_LOST = 1;
+              private static final int HAPTIC_ULTIMATE = 2;
               private static final long ULTIMATE_TRIGGER_MS = 280L;
               private static final Handler HANDLER = new Handler(Looper.getMainLooper());
 
@@ -377,16 +388,31 @@ jobs:
               private static PendingIntent permissionIntent;
               private static BroadcastReceiver usbReceiver;
               private static UsbDevice usbDevice;
-              private static UsbDeviceConnection connection;
-              private static int hidInterfaceId = -1;
+              private static volatile UsbDeviceConnection connection;
+              private static UsbInterface hidInterface;
+              private static UsbEndpoint inputEndpoint;
+              private static UsbEndpoint outputEndpoint;
+              private static volatile UsbRequest activeRequest;
+              private static Thread usbThread;
+              private static volatile boolean usbThreadRunning;
+              private static volatile int requestedTriggerState = TRIGGER_OFF;
+              private static volatile int sentTriggerState = -1;
+              private static volatile int requestedHapticState = HAPTIC_OFF;
+              private static volatile int sentHapticState = -1;
               private static int appliedState = -1;
               private static int effectGeneration;
+              private static int hapticGeneration;
               private static boolean desiredReady;
               private static boolean ultimateEffectActive;
-              private static boolean writeBlocked;
+              private static volatile boolean writeBlocked;
               private static boolean started;
 
               private DualSenseUsb() {}
+
+              private static native void updateNativeGamepad(
+                      boolean connected, int buttons, int leftX, int leftY,
+                      int leftTrigger, int rightTrigger
+              );
 
               static void start(Activity owner) {
                   activity = owner;
@@ -466,13 +492,32 @@ jobs:
                   }
               }
 
+              static boolean playHaptic(int event) {
+                  if (connection == null || !usbThreadRunning || writeBlocked) return false;
+                  if (event != HAPTIC_LIFE_LOST && event != HAPTIC_ULTIMATE) return false;
+
+                  requestedHapticState = event;
+                  final int generation = ++hapticGeneration;
+                  long duration = event == HAPTIC_LIFE_LOST ? 90L : 420L;
+                  HANDLER.postDelayed(new Runnable() {
+                      @Override
+                      public void run() {
+                          if (generation != hapticGeneration) return;
+                          requestedHapticState = HAPTIC_OFF;
+                      }
+                  }, duration);
+                  return true;
+              }
+
               static void pause() {
                   desiredReady = false;
                   ultimateEffectActive = false;
                   effectGeneration += 1;
                   HANDLER.removeCallbacksAndMessages(null);
-                  if (connection != null) {
-                      sendTriggerReport(TRIGGER_OFF);
+                  hapticGeneration += 1;
+                  requestedHapticState = HAPTIC_OFF;
+                  if (connection != null && usbThreadRunning) {
+                      requestedTriggerState = TRIGGER_OFF;
                       appliedState = TRIGGER_OFF;
                   }
               }
@@ -515,28 +560,49 @@ jobs:
                           !usbManager.hasPermission(device)) return;
                   resetAndClose();
 
-                  UsbInterface hidInterface = findGamepadInterface(device);
-                  if (hidInterface == null) return;
+                  UsbInterface targetInterface = findGamepadInterface(device);
+                  if (targetInterface == null) {
+                      showStatus("DualSense USB: HID-интерфейс не найден");
+                      return;
+                  }
+
+                  UsbEndpoint targetInput = findEndpoint(
+                          targetInterface, UsbConstants.USB_DIR_IN
+                  );
+                  UsbEndpoint targetOutput = findEndpoint(
+                          targetInterface, UsbConstants.USB_DIR_OUT
+                  );
+                  if (targetInput == null || targetOutput == null) {
+                      showStatus("DualSense USB: interrupt endpoints не найдены");
+                      return;
+                  }
 
                   UsbDeviceConnection opened = usbManager.openDevice(device);
-                  if (opened == null) return;
+                  if (opened == null) {
+                      showStatus("DualSense USB: устройство не открылось");
+                      return;
+                  }
+
+                  //force=true отключает системный HID-драйвер от интерфейса.
+                  //После этого ввод читает наш USB worker, поэтому кнопки не теряются.
+                  if (!opened.claimInterface(targetInterface, true)) {
+                      opened.close();
+                      showStatus("DualSense USB: не удалось захватить HID-интерфейс");
+                      return;
+                  }
 
                   usbDevice = device;
                   connection = opened;
-                  hidInterfaceId = hidInterface.getId();
+                  hidInterface = targetInterface;
+                  inputEndpoint = targetInput;
+                  outputEndpoint = targetOutput;
                   appliedState = -1;
                   writeBlocked = false;
-
-                  //Endpoint zero does not claim the HID interface, so Android keeps
-                  //reading sticks and buttons while we only update the trigger motors.
-                  if (!sendTriggerReport(TRIGGER_OFF)) {
-                      writeBlocked = true;
-                      showStatus("DualSense USB: команда триггеров заблокирована");
-                      return;
-                  }
-                  appliedState = TRIGGER_OFF;
-                  applyState(desiredReady ? TRIGGER_READY : TRIGGER_OFF);
-                  showStatus("DualSense USB: адаптивные триггеры подключены");
+                  requestedTriggerState = desiredReady ? TRIGGER_READY : TRIGGER_OFF;
+                  sentTriggerState = -1;
+                  requestedHapticState = HAPTIC_OFF;
+                  sentHapticState = -1;
+                  startUsbThread(opened, targetInput, targetOutput);
               }
 
               private static UsbInterface findGamepadInterface(UsbDevice device) {
@@ -549,59 +615,298 @@ jobs:
                   return null;
               }
 
-              private static void applyState(int state) {
-                  if (connection == null || writeBlocked || state == appliedState) return;
-                  if (sendTriggerReport(state)) {
-                      appliedState = state;
-                  } else {
-                      //One best-effort reset prevents a half-applied effect from
-                      //remaining active after a transient USB write error.
-                      sendTriggerReport(TRIGGER_OFF);
-                      appliedState = TRIGGER_OFF;
-                      //Do not retry every 16 ms on phones whose USB stack blocks
-                      //class reports. Normal controller input and vibration still work.
-                      writeBlocked = true;
-                      showStatus("DualSense USB: ошибка отправки эффекта");
+              private static UsbEndpoint findEndpoint(UsbInterface target, int direction) {
+                  for (int i = 0; i < target.getEndpointCount(); i++) {
+                      UsbEndpoint endpoint = target.getEndpoint(i);
+                      if (endpoint.getDirection() == direction &&
+                              endpoint.getType() == UsbConstants.USB_ENDPOINT_XFER_INT) {
+                          return endpoint;
+                      }
                   }
+                  return null;
               }
 
-              private static boolean sendTriggerReport(int state) {
-                  if (connection == null || hidInterfaceId < 0) return false;
+              private static void applyState(int state) {
+                  if (connection == null || !usbThreadRunning || writeBlocked ||
+                          state == appliedState) return;
+                  requestedTriggerState = state;
+                  appliedState = state;
+              }
 
-                  //SET_REPORT carries the report ID in wValue. The data stage must
-                  //start with the common payload, without a second 0x02 report ID.
-                  //The USB HID descriptor defines report 0x02 as 47 payload bytes.
-                  byte[] reportPayload = new byte[47];
-                  reportPayload[0] = 0x0c; //right-trigger + left-trigger update flags
+              private static byte[] createOutputReport(int triggerState, int hapticState) {
+                  //Полный проводной output report DualSense: ID 0x02 + 62 байта.
+                  byte[] report = new byte[63];
+                  report[0] = 0x02;
+                  report[1] = 0x0c; //right-trigger + left-trigger update flags
+                  fillTriggerEffect(report, 11, triggerState);
+                  fillTriggerEffect(report, 22, triggerState);
 
-                  fillTriggerEffect(reportPayload, 10, state);
-                  fillTriggerEffect(reportPayload, 21, state);
-
-                  int result = connection.controlTransfer(
-                          0x21,            //host-to-device, HID class, interface
-                          0x09,            //SET_REPORT
-                          0x0202,          //output report, ID 0x02
-                          hidInterfaceId,
-                          reportPayload,
-                          reportPayload.length,
-                          80
-                  );
-                  return result == reportPayload.length;
+                  if (hapticState != HAPTIC_OFF) {
+                      //Compatible vibration + haptics select; байты 3/4 —
+                      //высокочастотный и низкочастотный моторы DualSense.
+                      report[1] |= 0x03;
+                      if (hapticState == HAPTIC_LIFE_LOST) {
+                          report[3] = 70;
+                          report[4] = 95;
+                      } else {
+                          report[3] = (byte)200;
+                          report[4] = (byte)255;
+                      }
+                  }
+                  return report;
               }
 
               private static void fillTriggerEffect(byte[] report, int offset, int state) {
-                  if (state == TRIGGER_READY) {
-                      //A mild resistance from roughly one third of the travel.
-                      report[offset] = 0x01;
-                      report[offset + 1] = 0x03;
-                      report[offset + 2] = 0x03;
+                  if (state == TRIGGER_OFF) {
+                      report[offset] = 0x05;
+                  } else if (state == TRIGGER_READY) {
+                      //Feedback mode: mild resistance from zone 3 to the end.
+                      report[offset] = 0x21;
+                      int activeZones = 0;
+                      int strengthZones = 0;
+                      int encodedStrength = 2; //strength 3 encoded as strength - 1
+                      for (int zone = 3; zone < 10; zone++) {
+                          activeZones |= 1 << zone;
+                          strengthZones |= encodedStrength << (3*zone);
+                      }
+                      report[offset + 1] = (byte)(activeZones & 0xff);
+                      report[offset + 2] = (byte)((activeZones >> 8) & 0xff);
+                      report[offset + 3] = (byte)(strengthZones & 0xff);
+                      report[offset + 4] = (byte)((strengthZones >> 8) & 0xff);
+                      report[offset + 5] = (byte)((strengthZones >> 16) & 0xff);
+                      report[offset + 6] = (byte)((strengthZones >> 24) & 0xff);
                   } else if (state == TRIGGER_ULTIMATE) {
-                      //A strong weapon-style wall followed by a tactile break-through.
-                      report[offset] = 0x02;
-                      report[offset + 1] = 0x02;
-                      report[offset + 2] = 0x07;
-                      report[offset + 3] = 0x08;
+                      //Weapon mode: strong wall between zones 2 and 7.
+                      report[offset] = 0x25;
+                      int startStopZones = (1 << 2) | (1 << 7);
+                      report[offset + 1] = (byte)(startStopZones & 0xff);
+                      report[offset + 2] = (byte)((startStopZones >> 8) & 0xff);
+                      report[offset + 3] = 0x07; //strength 8 encoded as strength - 1
                   }
+              }
+
+              private static void startUsbThread(
+                      final UsbDeviceConnection workerConnection,
+                      final UsbEndpoint workerInput,
+                      final UsbEndpoint workerOutput
+              ) {
+                  usbThreadRunning = true;
+                  publishNativeGamepad(true, 0, 128, 128, 0, 0);
+                  usbThread = new Thread(new Runnable() {
+                      @Override
+                      public void run() {
+                          runUsbLoop(workerConnection, workerInput, workerOutput);
+                      }
+                  }, "DualSenseUsbWorker");
+                  usbThread.start();
+              }
+
+              private static void runUsbLoop(
+                      UsbDeviceConnection workerConnection,
+                      UsbEndpoint workerInput,
+                      UsbEndpoint workerOutput
+              ) {
+                  UsbRequest inputRequest = new UsbRequest();
+                  UsbRequest outputRequest = new UsbRequest();
+                  boolean inputInitialized = inputRequest.initialize(
+                          workerConnection, workerInput
+                  );
+                  boolean outputInitialized = outputRequest.initialize(
+                          workerConnection, workerOutput
+                  );
+
+                  if (!inputInitialized || !outputInitialized) {
+                      writeBlocked = true;
+                      usbThreadRunning = false;
+                      showStatus("DualSense USB: UsbRequest не инициализирован");
+                      if (inputInitialized) inputRequest.close();
+                      if (outputInitialized) outputRequest.close();
+                      publishNativeGamepad(false, 0, 128, 128, 0, 0);
+                      scheduleResetAfterFailure(workerConnection);
+                      return;
+                  }
+
+                  ByteBuffer inputBuffer = ByteBuffer.allocateDirect(64);
+                  ByteBuffer outputBuffer = ByteBuffer.allocateDirect(63);
+                  boolean connectionAnnounced = false;
+                  boolean failed = false;
+
+                  try {
+                      while (usbThreadRunning && connection == workerConnection) {
+                          int requestedState = requestedTriggerState;
+                          int requestedHaptic = requestedHapticState;
+                          if (requestedState != sentTriggerState ||
+                                  requestedHaptic != sentHapticState) {
+                              int outputResult = writeOutputReport(
+                                      workerConnection, outputRequest,
+                                      outputBuffer, requestedState, requestedHaptic
+                              );
+                              if (outputResult != 63) {
+                                  writeBlocked = true;
+                                  failed = true;
+                                  showStatus("DualSense USB: ошибка USB OUT " + outputResult);
+                                  break;
+                              }
+                              sentTriggerState = requestedState;
+                              sentHapticState = requestedHaptic;
+                              if (!connectionAnnounced) {
+                                  connectionAnnounced = true;
+                                  showStatus("Cube Dodge v17: USB-ввод, вибрация и триггеры подключены");
+                              }
+                          }
+
+                          inputBuffer.clear();
+                          activeRequest = inputRequest;
+                          if (!queueRequest(inputRequest, inputBuffer, 64)) {
+                              activeRequest = null;
+                              failed = true;
+                              showStatus("DualSense USB: ошибка очереди USB IN");
+                              break;
+                          }
+
+                          UsbRequest completed = workerConnection.requestWait();
+                          activeRequest = null;
+                          if (!usbThreadRunning || connection != workerConnection) break;
+                          if (completed != inputRequest) continue;
+
+                          int length = inputBuffer.position();
+                          if (length > 0) publishInputReport(inputBuffer, length);
+                      }
+                  } catch (RuntimeException error) {
+                      if (usbThreadRunning) {
+                          failed = true;
+                          showStatus("DualSense USB: поток ввода остановлен");
+                      }
+                  } finally {
+                      usbThreadRunning = false;
+                      activeRequest = null;
+                      inputRequest.close();
+                      outputRequest.close();
+                      publishNativeGamepad(false, 0, 128, 128, 0, 0);
+                      if (failed) scheduleResetAfterFailure(workerConnection);
+                  }
+              }
+
+              private static int writeOutputReport(
+                      UsbDeviceConnection workerConnection,
+                      UsbRequest request,
+                      ByteBuffer buffer,
+                      int triggerState,
+                      int hapticState
+              ) {
+                  byte[] report = createOutputReport(triggerState, hapticState);
+                  buffer.clear();
+                  buffer.put(report);
+                  buffer.flip();
+
+                  activeRequest = request;
+                  if (!queueRequest(request, buffer, report.length)) {
+                      activeRequest = null;
+                      return -2;
+                  }
+                  UsbRequest completed = workerConnection.requestWait();
+                  activeRequest = null;
+                  if (completed != request) return -3;
+                  return buffer.position();
+              }
+
+              @SuppressWarnings("deprecation")
+              private static boolean queueRequest(
+                      UsbRequest request, ByteBuffer buffer, int length
+              ) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      return request.queue(buffer);
+                  }
+                  return request.queue(buffer, length);
+              }
+
+              private static void publishInputReport(ByteBuffer report, int length) {
+                  if (length < 11 || (report.get(0) & 0xff) != 0x01) return;
+
+                  int leftX = report.get(1) & 0xff;
+                  int leftY = report.get(2) & 0xff;
+                  int leftTrigger = report.get(5) & 0xff;
+                  int rightTrigger = report.get(6) & 0xff;
+                  int buttons0 = report.get(8) & 0xff;
+                  int buttons1 = report.get(9) & 0xff;
+                  int buttons2 = report.get(10) & 0xff;
+                  int buttons = 0;
+
+                  int hat = buttons0 & 0x0f;
+                  if (hat == 0 || hat == 1 || hat == 7) buttons |= 1 << 0;
+                  if (hat == 3 || hat == 4 || hat == 5) buttons |= 1 << 1;
+                  if (hat == 5 || hat == 6 || hat == 7) buttons |= 1 << 2;
+                  if (hat == 1 || hat == 2 || hat == 3) buttons |= 1 << 3;
+
+                  if ((buttons0 & 0x10) != 0) buttons |= 1 << 4;  //Square
+                  if ((buttons0 & 0x20) != 0) buttons |= 1 << 5;  //Cross
+                  if ((buttons0 & 0x40) != 0) buttons |= 1 << 6;  //Circle
+                  if ((buttons0 & 0x80) != 0) buttons |= 1 << 7;  //Triangle
+                  if ((buttons1 & 0x01) != 0) buttons |= 1 << 8;  //L1
+                  if ((buttons1 & 0x02) != 0) buttons |= 1 << 9;  //R1
+                  if ((buttons1 & 0x04) != 0) buttons |= 1 << 10; //L2
+                  if ((buttons1 & 0x08) != 0) buttons |= 1 << 11; //R2
+                  if ((buttons1 & 0x10) != 0) buttons |= 1 << 12; //Create
+                  if ((buttons1 & 0x20) != 0) buttons |= 1 << 13; //Options
+                  if ((buttons1 & 0x40) != 0) buttons |= 1 << 14; //L3
+                  if ((buttons1 & 0x80) != 0) buttons |= 1 << 15; //R3
+                  if ((buttons2 & 0x01) != 0) buttons |= 1 << 16; //PS
+                  if ((buttons2 & 0x02) != 0) buttons |= 1 << 17; //Touchpad
+
+                  publishNativeGamepad(
+                          true, buttons, leftX, leftY, leftTrigger, rightTrigger
+                  );
+              }
+
+              private static void publishNativeGamepad(
+                      boolean connected, int buttons, int leftX, int leftY,
+                      int leftTrigger, int rightTrigger
+              ) {
+                  try {
+                      updateNativeGamepad(
+                              connected, buttons, leftX, leftY,
+                              leftTrigger, rightTrigger
+                      );
+                  } catch (UnsatisfiedLinkError ignored) {
+                      //Native library can still be starting during Activity creation.
+                  }
+              }
+
+              private static void stopUsbThread() {
+                  usbThreadRunning = false;
+                  UsbRequest request = activeRequest;
+                  if (request != null) {
+                      try {
+                          request.cancel();
+                      } catch (RuntimeException ignored) {
+                          //The connection may already be gone after physical detach.
+                      }
+                  }
+
+                  Thread thread = usbThread;
+                  if (thread != null && thread != Thread.currentThread()) {
+                      try {
+                          thread.join(180L);
+                      } catch (InterruptedException ignored) {
+                          Thread.currentThread().interrupt();
+                      }
+                  }
+                  usbThread = null;
+                  activeRequest = null;
+                  publishNativeGamepad(false, 0, 128, 128, 0, 0);
+              }
+
+              private static void scheduleResetAfterFailure(
+                      final UsbDeviceConnection failedConnection
+              ) {
+                  Activity owner = activity;
+                  if (owner == null) return;
+                  owner.runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          if (connection == failedConnection) resetAndClose();
+                      }
+                  });
               }
 
               private static void showStatus(String message) {
@@ -615,18 +920,52 @@ jobs:
                   });
               }
 
+              private static void sendFinalTriggerOff(
+                      UsbDeviceConnection opened, UsbInterface claimedInterface
+              ) {
+                  if (opened == null || claimedInterface == null) return;
+                  byte[] fullReport = createOutputReport(TRIGGER_OFF, HAPTIC_OFF);
+                  byte[] payload = new byte[47];
+                  System.arraycopy(fullReport, 1, payload, 0, payload.length);
+                  opened.controlTransfer(
+                          0x21, 0x09, 0x0202, claimedInterface.getId(),
+                          payload, payload.length, 80
+                  );
+              }
+
               private static void resetAndClose() {
-                  if (connection != null) {
-                      sendTriggerReport(TRIGGER_OFF);
+                  UsbDeviceConnection opened = connection;
+                  UsbInterface claimedInterface = hidInterface;
+                  requestedTriggerState = TRIGGER_OFF;
+                  stopUsbThread();
+                  if (opened != null) {
+                      try {
+                          sendFinalTriggerOff(opened, claimedInterface);
+                      } catch (RuntimeException ignored) {
+                          //Physical detach can invalidate the file descriptor immediately.
+                      }
+                      if (claimedInterface != null) {
+                          try {
+                              opened.releaseInterface(claimedInterface);
+                          } catch (RuntimeException ignored) {
+                              //Nothing remains to release after a detached cable.
+                          }
+                      }
+                      opened.close();
                   }
-                  if (connection != null) connection.close();
                   connection = null;
                   usbDevice = null;
-                  hidInterfaceId = -1;
+                  hidInterface = null;
+                  inputEndpoint = null;
+                  outputEndpoint = null;
                   appliedState = -1;
+                  sentTriggerState = -1;
+                  requestedHapticState = HAPTIC_OFF;
+                  sentHapticState = -1;
                   writeBlocked = false;
                   ultimateEffectActive = false;
                   effectGeneration += 1;
+                  hapticGeneration += 1;
               }
 
               private static boolean isDualSense(UsbDevice device) {
@@ -664,12 +1003,12 @@ jobs:
           mkdir -p output
           apk_path="$(find android-build/app/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
           test -n "$apk_path"
-          cp "$apk_path" output/CubeDodge-android-arm64-debug.apk
+          cp "$apk_path" output/CubeDodge-v17-direct-usb-arm64-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: CubeDodge-Android-APK
-          path: output/CubeDodge-android-arm64-debug.apk
+          name: CubeDodge-v17-Direct-USB-APK
+          path: output/CubeDodge-v17-direct-usb-arm64-debug.apk
           if-no-files-found: error
           retention-days: 30

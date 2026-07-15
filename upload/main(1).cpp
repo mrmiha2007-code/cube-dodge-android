@@ -33,12 +33,52 @@ enum AndroidAdaptiveTriggerPulse
     ANDROID_TRIGGER_PULSE_ULTIMATE = 1
 };
 
+enum DirectUsbButton
+{
+    DIRECT_USB_DPAD_UP = 1 << 0,
+    DIRECT_USB_DPAD_DOWN = 1 << 1,
+    DIRECT_USB_DPAD_LEFT = 1 << 2,
+    DIRECT_USB_DPAD_RIGHT = 1 << 3,
+    DIRECT_USB_SQUARE = 1 << 4,
+    DIRECT_USB_CROSS = 1 << 5,
+    DIRECT_USB_CIRCLE = 1 << 6,
+    DIRECT_USB_TRIANGLE = 1 << 7,
+    DIRECT_USB_L1 = 1 << 8,
+    DIRECT_USB_R1 = 1 << 9,
+    DIRECT_USB_L2 = 1 << 10,
+    DIRECT_USB_R2 = 1 << 11,
+    DIRECT_USB_CREATE = 1 << 12,
+    DIRECT_USB_OPTIONS = 1 << 13,
+    DIRECT_USB_L3 = 1 << 14,
+    DIRECT_USB_R3 = 1 << 15,
+    DIRECT_USB_PS = 1 << 16,
+    DIRECT_USB_TOUCHPAD = 1 << 17
+};
+
+struct DirectUsbGamepadFrame
+{
+    bool connected = false;
+    unsigned int buttonsDown = 0;
+    unsigned int buttonsPressed = 0;
+    float leftX = 0.0f;
+    float leftY = 0.0f;
+    float leftTrigger = 0.0f;
+    float rightTrigger = 0.0f;
+};
+
 #if defined(PLATFORM_ANDROID)
 //Java-часть Android опрашивает это значение и отправляет эффект в DualSense.
 //Так ПК-версия не получает ни зависимостей Android, ни изменений управления.
 static std::atomic<int> androidHapticEvent{ANDROID_HAPTIC_NONE};
 static std::atomic<int> androidUltimateReady{0};
 static std::atomic<int> androidAdaptiveTriggerPulse{ANDROID_TRIGGER_PULSE_NONE};
+static std::atomic<int> androidUsbInputConnected{0};
+static std::atomic<int> androidUsbButtons{0};
+static std::atomic<int> androidUsbPressedButtons{0};
+static std::atomic<int> androidUsbLeftX{128};
+static std::atomic<int> androidUsbLeftY{128};
+static std::atomic<int> androidUsbLeftTrigger{0};
+static std::atomic<int> androidUsbRightTrigger{0};
 
 void requestAndroidHaptic(AndroidHapticEvent event)
 {
@@ -73,10 +113,49 @@ Java_com_example_cubedodge_HapticBridge_consumeAdaptiveTriggerPulse(JNIEnv *, jc
     return androidAdaptiveTriggerPulse.exchange(
         ANDROID_TRIGGER_PULSE_NONE, std::memory_order_acq_rel);
 }
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_cubedodge_DualSenseUsb_updateNativeGamepad(
+    JNIEnv *, jclass, jboolean connected, jint buttons,
+    jint leftX, jint leftY, jint leftTrigger, jint rightTrigger)
+{
+    if (connected == JNI_FALSE) {
+        androidUsbInputConnected.store(0, std::memory_order_release);
+        androidUsbButtons.store(0, std::memory_order_release);
+        androidUsbPressedButtons.store(0, std::memory_order_release);
+        return;
+    }
+
+    int previousButtons = androidUsbButtons.exchange((int)buttons, std::memory_order_acq_rel);
+    androidUsbPressedButtons.fetch_or(
+        ((int)buttons) & ~previousButtons, std::memory_order_acq_rel);
+    androidUsbLeftX.store((int)leftX, std::memory_order_release);
+    androidUsbLeftY.store((int)leftY, std::memory_order_release);
+    androidUsbLeftTrigger.store((int)leftTrigger, std::memory_order_release);
+    androidUsbRightTrigger.store((int)rightTrigger, std::memory_order_release);
+    androidUsbInputConnected.store(1, std::memory_order_release);
+}
+
+DirectUsbGamepadFrame pollDirectUsbGamepad()
+{
+    DirectUsbGamepadFrame frame;
+    frame.connected = androidUsbInputConnected.load(std::memory_order_acquire) != 0;
+    if (!frame.connected) return frame;
+
+    frame.buttonsDown = (unsigned int)androidUsbButtons.load(std::memory_order_acquire);
+    frame.buttonsPressed = (unsigned int)androidUsbPressedButtons.exchange(
+        0, std::memory_order_acq_rel);
+    frame.leftX = (androidUsbLeftX.load(std::memory_order_acquire) - 127.5f)/127.5f;
+    frame.leftY = (androidUsbLeftY.load(std::memory_order_acquire) - 127.5f)/127.5f;
+    frame.leftTrigger = androidUsbLeftTrigger.load(std::memory_order_acquire)/255.0f;
+    frame.rightTrigger = androidUsbRightTrigger.load(std::memory_order_acquire)/255.0f;
+    return frame;
+}
 #else
 void requestAndroidHaptic(AndroidHapticEvent) {}
 void setAndroidUltimateReady(bool) {}
 void requestAndroidAdaptiveTriggerPulse(AndroidAdaptiveTriggerPulse) {}
+DirectUsbGamepadFrame pollDirectUsbGamepad() { return {}; }
 #endif
 
 struct ExplosionParticle
@@ -315,9 +394,24 @@ int main()
             }
         }
 
+        DirectUsbGamepadFrame directUsbGamepad = pollDirectUsbGamepad();
+        auto gamepadButtonPressed = [&](int raylibButton, unsigned int directUsbButton) {
+            if (directUsbGamepad.connected)
+                return (directUsbGamepad.buttonsPressed & directUsbButton) != 0;
+            return gamepad != -1 && IsGamepadButtonPressed(gamepad, raylibButton);
+        };
+        auto gamepadButtonDown = [&](int raylibButton, unsigned int directUsbButton) {
+            if (directUsbGamepad.connected)
+                return (directUsbGamepad.buttonsDown & directUsbButton) != 0;
+            return gamepad != -1 && IsGamepadButtonDown(gamepad, raylibButton);
+        };
+
         float leftStickX = 0.0f;
         float leftStickY = 0.0f;
-        if (gamepad != -1) {
+        if (directUsbGamepad.connected) {
+            leftStickX = directUsbGamepad.leftX;
+            leftStickY = directUsbGamepad.leftY;
+        } else if (gamepad != -1) {
             leftStickX = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X);
             leftStickY = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
         }
@@ -329,19 +423,17 @@ int main()
 
         //Options открывает настройки поверх игры: сама игра при этом не ставится на паузу.
         if (IsKeyPressed(KEY_F10) ||
-            (gamepad != -1 && IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_MIDDLE_RIGHT))) {
+            gamepadButtonPressed(GAMEPAD_BUTTON_MIDDLE_RIGHT, DIRECT_USB_OPTIONS)) {
             settingsOpen = !settingsOpen;
         }
 
         if (settingsOpen) {
             bool selectPrevious = IsKeyPressed(KEY_UP) || IsKeyPressed(KEY_LEFT) ||
-                (gamepad != -1 &&
-                    (IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_LEFT_FACE_UP) ||
-                     IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_LEFT_FACE_LEFT)));
+                gamepadButtonPressed(GAMEPAD_BUTTON_LEFT_FACE_UP, DIRECT_USB_DPAD_UP) ||
+                gamepadButtonPressed(GAMEPAD_BUTTON_LEFT_FACE_LEFT, DIRECT_USB_DPAD_LEFT);
             bool selectNext = IsKeyPressed(KEY_DOWN) || IsKeyPressed(KEY_RIGHT) ||
-                (gamepad != -1 &&
-                    (IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_LEFT_FACE_DOWN) ||
-                     IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_LEFT_FACE_RIGHT)));
+                gamepadButtonPressed(GAMEPAD_BUTTON_LEFT_FACE_DOWN, DIRECT_USB_DPAD_DOWN) ||
+                gamepadButtonPressed(GAMEPAD_BUTTON_LEFT_FACE_RIGHT, DIRECT_USB_DPAD_RIGHT);
 
             if (selectPrevious)
                 settingsSelected = (settingsSelected + settingsCount - 1)%settingsCount;
@@ -349,8 +441,7 @@ int main()
                 settingsSelected = (settingsSelected + 1)%settingsCount;
 
             bool toggleSetting = IsKeyPressed(KEY_ENTER) ||
-                (gamepad != -1 &&
-                    IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT));
+                gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_LEFT, DIRECT_USB_SQUARE);
             if (toggleSetting && settingsSelected == 0)
                 accelerationEnabled = !accelerationEnabled;
         }
@@ -360,13 +451,12 @@ int main()
         //Ускорение сначала нужно включить в настройках, затем удерживать L1 + R1.
         //Пробел оставлен как клавиатурный вариант для запуска и тестов через VS Code.
         bool accelerationHeld = (IsKeyDown(KEY_SPACE) ||
-            (gamepad != -1 &&
-                IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_LEFT_TRIGGER_1) &&
-                IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_TRIGGER_1)));
+            (gamepadButtonDown(GAMEPAD_BUTTON_LEFT_TRIGGER_1, DIRECT_USB_L1) &&
+             gamepadButtonDown(GAMEPAD_BUTTON_RIGHT_TRIGGER_1, DIRECT_USB_R1)));
         if (accelerationEnabled && accelerationHeld) speedBoost = 2;
         //Переключатель худа: H на клавиатуре или круг на DualSense
         if (IsKeyPressed(KEY_H) ||
-            (gamepad != -1 && IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_RIGHT))) hideHUD = 1 - 1*hideHUD;
+            gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT, DIRECT_USB_CIRCLE)) hideHUD = 1 - 1*hideHUD;
         //Быстрый лвл скип
         if (IsKeyPressed(KEY_ONE)) Score = 0;
         if (IsKeyPressed(KEY_TWO)) Score = 500;
@@ -376,7 +466,7 @@ int main()
         if (IsKeyPressed(KEY_SIX)) Score = 12000;
         //Фулскрин
         if (IsKeyPressed(KEY_F11) ||
-            (gamepad != -1 && IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_MIDDLE_LEFT))) {
+            gamepadButtonPressed(GAMEPAD_BUTTON_MIDDLE_LEFT, DIRECT_USB_CREATE)) {
             ToggleFullscreen();
         }
 
@@ -387,9 +477,11 @@ int main()
             if (ultimateFlashFrames == 0 && ultimateCharge < ultimateMax) ultimateCharge += 1;
             if (ultimateCharge > ultimateMax) ultimateCharge = ultimateMax;
 
-            bool ultimatePressed = gamepad != -1 &&
-                GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_TRIGGER) > 0.5f &&
-                GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_TRIGGER) > 0.5f;
+            bool ultimatePressed = directUsbGamepad.connected ?
+                (directUsbGamepad.leftTrigger > 0.5f && directUsbGamepad.rightTrigger > 0.5f) :
+                (gamepad != -1 &&
+                 GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_TRIGGER) > 0.5f &&
+                 GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_TRIGGER) > 0.5f);
             if (!ultimatePressed) ultimateNeedsRelease = false;
 
             bool ultimateStarted = false;
@@ -483,8 +575,8 @@ int main()
                DashChargesSec -= 180;
             }
             if ((IsKeyPressed(KEY_LEFT_SHIFT) ||
-                (!settingsOpen && gamepad != -1 &&
-                    IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_LEFT))) &&
+                (!settingsOpen &&
+                    gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_LEFT, DIRECT_USB_SQUARE))) &&
                 DashCharges > 0) {
                 DashEffect += 8;
                 invFrames += 8;
@@ -978,7 +1070,7 @@ int main()
             
             //Счёт
             bool showBestScore = IsKeyDown(KEY_TAB) ||
-                (gamepad != -1 && IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_DOWN));
+                gamepadButtonDown(GAMEPAD_BUTTON_RIGHT_FACE_DOWN, DIRECT_USB_CROSS);
 
             if (showBestScore) {
                 if (Gameover == 0) DrawText(TextFormat("The best score: %i", Best), 20, 20, 30, BLACK);
@@ -999,7 +1091,7 @@ int main()
             DrawText("Press R",145,350,120,VIOLET);
             DrawText("to restart",80,460,120,VIOLET);
             if (IsKeyPressed(KEY_R) ||
-                (gamepad != -1 && IsGamepadButtonPressed(gamepad, GAMEPAD_BUTTON_RIGHT_FACE_UP))) {
+                gamepadButtonPressed(GAMEPAD_BUTTON_RIGHT_FACE_UP, DIRECT_USB_TRIANGLE)) {
                 player.x = 375;
                 player.y = 275;
                 enemy1.y = -50;
